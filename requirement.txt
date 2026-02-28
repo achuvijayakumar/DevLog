@@ -1,1 +1,4 @@
 watchdog
+streamlit
+pandas
+plotly
