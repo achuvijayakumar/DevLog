@@ -1,14 +1,16 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta, date
 import plotly.express as px
 import plotly.graph_objects as go
 import os
 import json
 
-DB_NAME = "/home/memoryping/apps/Devlog/devlog.db"
+from config import DB_PATH, ACTIVE_SESSION_FILE, IDLE_TIMEOUT_SECONDS
+
+DB_NAME = DB_PATH
+LIVE_SESSION_GRACE_SECONDS = 30
 
 st.set_page_config(
     page_title="Devlog Tracker",
@@ -17,7 +19,7 @@ st.set_page_config(
 )
 
 st.title("⏱️ Devlog Tracking Dashboard")
-st.markdown("Monitor your ongoing and past coding sessions.")
+st.markdown("Monitor your ongoing and past coding sessions")
 
 # --- Data Loading ---
 @st.cache_data(ttl=5)
@@ -28,12 +30,13 @@ def load_data():
     try:
         conn = sqlite3.connect(DB_NAME)
         try:
-            query = "SELECT id, project, git_branch, start_time, end_time, duration FROM sessions ORDER BY id DESC"
+            query = "SELECT id, project, git_branch, category, start_time, end_time, duration FROM sessions ORDER BY id DESC"
             df = pd.read_sql_query(query, conn)
         except sqlite3.OperationalError:
             query = "SELECT id, project, start_time, end_time, duration FROM sessions ORDER BY id DESC"
             df = pd.read_sql_query(query, conn)
             df['git_branch'] = None
+            df['category'] = None
 
         conn.close()
         
@@ -45,9 +48,9 @@ def load_data():
             df['start_dt'] = pd.to_datetime(df['start_time'])
             df['start_time'] = df['start_dt'].dt.strftime('%Y-%m-%d %H:%M:%S')
             
-            df['end_time'] = pd.to_datetime(df['end_time'], errors='ignore')
+            df['end_time'] = pd.to_datetime(df['end_time'], errors='coerce')
             df['end_time'] = df['end_time'].apply(
-                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) and isinstance(x, pd.Timestamp) else str(x)
+                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) and isinstance(x, pd.Timestamp) else str(x) if pd.notnull(x) else None
             )
             
         return df
@@ -57,13 +60,28 @@ def load_data():
 
 def get_active_session():
     """Reads the live session state dumped by tracker.py"""
-    live_file = "/tmp/devlog_active.json"
-    if os.path.exists(live_file):
+    if os.path.exists(ACTIVE_SESSION_FILE):
         try:
-            with open(live_file, "r") as f:
+            with open(ACTIVE_SESSION_FILE, "r") as f:
                 data = json.load(f)
+                now = datetime.now()
                 start = datetime.fromisoformat(data['start_time'])
-                duration = datetime.now() - start
+                last_activity_raw = data.get('last_activity') or data['start_time']
+                last_activity = datetime.fromisoformat(last_activity_raw)
+
+                tracker_pid = data.get('tracker_pid')
+                # The os.kill(pid, 0) check is unreliable on Windows and can incorrectly return WinError 87,
+                # causing the active session file to be prematurely deleted. We rely solely on the idle 
+                # timeout check below to garbage-collect stale sessions.
+
+                if now - last_activity > timedelta(seconds=IDLE_TIMEOUT_SECONDS + LIVE_SESSION_GRACE_SECONDS):
+                    try:
+                        os.remove(ACTIVE_SESSION_FILE)
+                    except OSError:
+                        pass
+                    return None, None
+
+                duration = max(now - start, timedelta(0))
                 duration_str = str(duration).split('.')[0]
                 return data, duration_str
         except Exception:
@@ -133,26 +151,39 @@ else:
 # --- Sidebar Filters ---
 st.sidebar.header("Filters")
 if not df.empty:
-    df['date_only'] = df['start_dt'].dt.date
-    min_date = df['date_only'].min()
-    max_date = df['date_only'].max()
-    
-    date_range = st.sidebar.date_input(
-        "Date Range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
+    # Category filter (All / Personal / Work)
+    category_filter = st.sidebar.radio(
+        "Category",
+        options=["All", "Personal", "Work"],
+        index=0,
+        horizontal=True
     )
-    
-    if len(date_range) == 2:
-        start_date, end_date = date_range
-        df = df[(df['date_only'] >= start_date) & (df['date_only'] <= end_date)]
-    
-    # Project filter
-    all_projects = sorted(df['project'].unique().tolist())
-    selected_projects = st.sidebar.multiselect("Projects", all_projects, default=all_projects)
-    if selected_projects:
-        df = df[df['project'].isin(selected_projects)]
+    if category_filter != "All":
+        df = df[df['category'] == category_filter.lower()]
+
+    if df.empty:
+        st.sidebar.info(f"No sessions recorded for **{category_filter}** yet.")
+    else:
+        df['date_only'] = df['start_dt'].dt.date
+        min_date = df['date_only'].min()
+        max_date = df['date_only'].max()
+        
+        date_range = st.sidebar.date_input(
+            "Date Range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date
+        )
+        
+        if len(date_range) == 2:
+            start_date, end_date = date_range
+            df = df[(df['date_only'] >= start_date) & (df['date_only'] <= end_date)]
+        
+        # Project filter
+        all_projects = sorted(df['project'].unique().tolist())
+        selected_projects = st.sidebar.multiselect("Projects", all_projects, default=all_projects)
+        if selected_projects:
+            df = df[df['project'].isin(selected_projects)]
 
 # --- Top Level Metrics ---
 if not df.empty:
@@ -164,15 +195,15 @@ if not df.empty:
     unique_projects = df['project'].nunique()
     avg_session_sec = df['duration_sec'].mean()
     
-    # Deep work: sessions >= 30 min
-    deep_work_count = len(df[df['duration_sec'] >= 1800])
+    # Deep work: sessions >= 15 min
+    deep_work_count = len(df[df['duration_sec'] >= 900])
     deep_work_pct = (deep_work_count / total_sessions * 100) if total_sessions > 0 else 0
     
     col1.metric("Total Sessions", total_sessions)
     col2.metric("Total Time", total_time_str)
     col3.metric("Projects", unique_projects)
     col4.metric("Avg Session", fmt_duration(avg_session_sec))
-    col5.metric("Deep Work", f"{deep_work_pct:.0f}%", help="Sessions ≥ 30 min as % of total")
+    col5.metric("Deep Work", f"{deep_work_pct:.0f}%", help="Sessions ≥ 15 min as % of total")
     
     # Streak row
     current_streak, longest_streak = compute_streak(df['date_only'])
@@ -214,7 +245,7 @@ with tab1:
         
         st.dataframe(
             display_df,
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )
 
@@ -235,7 +266,7 @@ with tab2:
             color_continuous_scale='Blues'
         )
         fig_heat.update_layout(margin=dict(t=10))
-        st.plotly_chart(fig_heat, use_container_width=True)
+        st.plotly_chart(fig_heat, width='stretch')
         st.divider()
         
         # --- Row 2: Project & Branch donuts ---
@@ -254,7 +285,7 @@ with tab2:
                 color_discrete_sequence=px.colors.sequential.Teal
             )
             fig.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             
         with col_chart2:
             st.subheader("🌿 Time per Branch")
@@ -269,7 +300,7 @@ with tab2:
                 color_discrete_sequence=px.colors.sequential.Purp
             )
             fig_branch.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig_branch, use_container_width=True)
+            st.plotly_chart(fig_branch, width='stretch')
         
         st.divider()
         
@@ -295,7 +326,7 @@ with tab2:
                 color_continuous_scale='Sunset'
             )
             fig_peak.update_layout(margin=dict(t=10), showlegend=False)
-            st.plotly_chart(fig_peak, use_container_width=True)
+            st.plotly_chart(fig_peak, width='stretch')
         
         with col_dow:
             st.subheader("📅 Day-of-Week Pattern")
@@ -317,7 +348,7 @@ with tab2:
                 category_orders={'day_name': day_order}
             )
             fig_dow.update_layout(margin=dict(t=10))
-            st.plotly_chart(fig_dow, use_container_width=True)
+            st.plotly_chart(fig_dow, width='stretch')
         
         st.divider()
         
@@ -340,7 +371,7 @@ with tab2:
                 bargap=0.1,
                 yaxis_title='Number of Sessions'
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width='stretch')
         
         with col_trend:
             st.subheader("📈 Weekly Coding Trend")
@@ -361,7 +392,7 @@ with tab2:
             )
             fig_weekly.update_layout(margin=dict(t=10))
             fig_weekly.update_traces(line=dict(width=3, color='#00CC96'), marker=dict(size=8))
-            st.plotly_chart(fig_weekly, use_container_width=True)
+            st.plotly_chart(fig_weekly, width='stretch')
         
         st.divider()
         
@@ -376,7 +407,7 @@ with tab2:
             labels={'duration_sec': 'Duration (Seconds)', 'id': 'Session ID'},
         )
         fig_bar.update_layout(margin=dict(t=10))
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width='stretch')
         
     else:
         st.info("Not enough data for analytics yet.")
@@ -397,7 +428,7 @@ with tab3:
         
         st.dataframe(
             avg_by_project[['Project', 'Sessions', 'Avg Duration', 'Median Duration', 'Total Time']],
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )
         
@@ -408,7 +439,7 @@ with tab3:
         top_sessions = df.nlargest(5, 'duration_sec')[['project', 'git_branch', 'start_time', 'duration_str']].copy()
         top_sessions.columns = ['Project', 'Branch', 'Started', 'Duration']
         top_sessions['Branch'] = top_sessions['Branch'].fillna('N/A')
-        st.dataframe(top_sessions, use_container_width=True, hide_index=True)
+        st.dataframe(top_sessions, width='stretch', hide_index=True)
         
         st.divider()
         
