@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.env
+
+# Devlog Specific
+config.json
+*.db
+*.db.bak
+/tmp/devlog_active.json
+
+# IDEs
+.vscode/
+.idea/
