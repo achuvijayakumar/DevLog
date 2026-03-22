@@ -1,0 +1,21 @@
+{
+  "watch": [
+    "/path/to/project1",
+    "/path/to/project2"
+  ],
+  "ignore_dirs": [
+    ".git",
+    "__pycache__",
+    "node_modules",
+    "venv",
+    ".env",
+    ".next",
+    "dist",
+    "logs",
+    "log"
+  ],
+  "idle_timeout_seconds": 300,
+  "merge_gap_seconds": 300,
+  "cross_project_merge": false,
+  "min_session_seconds": 10
+}

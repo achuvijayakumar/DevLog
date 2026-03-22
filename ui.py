@@ -1,16 +1,22 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta, date
 import plotly.express as px
 import plotly.graph_objects as go
 import os
 import json
 
-from config import DB_PATH, ACTIVE_SESSION_FILE, IDLE_TIMEOUT_SECONDS
+DB_NAME = "/home/memoryping/apps/Devlog/devlog.db"
 
-DB_NAME = DB_PATH
-LIVE_SESSION_GRACE_SECONDS = 30
+with open("/home/memoryping/apps/Devlog/config.json") as f:
+    config = json.load(f)
+
+# Load config options with logical defaults
+MERGE_GAP = timedelta(seconds=config.get("merge_gap_seconds", 300))
+CROSS_PROJECT_MERGE = config.get("cross_project_merge", False)
+
 
 st.set_page_config(
     page_title="Devlog Tracker",
@@ -19,7 +25,7 @@ st.set_page_config(
 )
 
 st.title("⏱️ Devlog Tracking Dashboard")
-st.markdown("Monitor your ongoing and past coding sessions")
+st.markdown("Monitor your ongoing and past coding sessions.")
 
 # --- Data Loading ---
 @st.cache_data(ttl=5)
@@ -30,13 +36,12 @@ def load_data():
     try:
         conn = sqlite3.connect(DB_NAME)
         try:
-            query = "SELECT id, project, git_branch, category, start_time, end_time, duration FROM sessions ORDER BY id DESC"
+            query = "SELECT id, project, git_branch, start_time, end_time, duration FROM sessions ORDER BY id DESC"
             df = pd.read_sql_query(query, conn)
         except sqlite3.OperationalError:
             query = "SELECT id, project, start_time, end_time, duration FROM sessions ORDER BY id DESC"
             df = pd.read_sql_query(query, conn)
             df['git_branch'] = None
-            df['category'] = None
 
         conn.close()
         
@@ -45,12 +50,12 @@ def load_data():
             df['duration_str'] = df['duration_sec'].apply(lambda x: str(timedelta(seconds=x)))
             
             # Keep raw datetime for analytics before formatting
-            df['start_dt'] = pd.to_datetime(df['start_time'])
+            df['start_dt'] = pd.to_datetime(df['start_time'], format='mixed', errors='coerce')
             df['start_time'] = df['start_dt'].dt.strftime('%Y-%m-%d %H:%M:%S')
             
-            df['end_time'] = pd.to_datetime(df['end_time'], errors='coerce')
+            df['end_time'] = pd.to_datetime(df['end_time'], format='mixed', errors='ignore')
             df['end_time'] = df['end_time'].apply(
-                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) and isinstance(x, pd.Timestamp) else str(x) if pd.notnull(x) else None
+                lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) and isinstance(x, pd.Timestamp) else str(x)
             )
             
         return df
@@ -60,28 +65,13 @@ def load_data():
 
 def get_active_session():
     """Reads the live session state dumped by tracker.py"""
-    if os.path.exists(ACTIVE_SESSION_FILE):
+    live_file = "/tmp/devlog_active.json"
+    if os.path.exists(live_file):
         try:
-            with open(ACTIVE_SESSION_FILE, "r") as f:
+            with open(live_file, "r") as f:
                 data = json.load(f)
-                now = datetime.now()
                 start = datetime.fromisoformat(data['start_time'])
-                last_activity_raw = data.get('last_activity') or data['start_time']
-                last_activity = datetime.fromisoformat(last_activity_raw)
-
-                tracker_pid = data.get('tracker_pid')
-                # The os.kill(pid, 0) check is unreliable on Windows and can incorrectly return WinError 87,
-                # causing the active session file to be prematurely deleted. We rely solely on the idle 
-                # timeout check below to garbage-collect stale sessions.
-
-                if now - last_activity > timedelta(seconds=IDLE_TIMEOUT_SECONDS + LIVE_SESSION_GRACE_SECONDS):
-                    try:
-                        os.remove(ACTIVE_SESSION_FILE)
-                    except OSError:
-                        pass
-                    return None, None
-
-                duration = max(now - start, timedelta(0))
+                duration = datetime.now() - start
                 duration_str = str(duration).split('.')[0]
                 return data, duration_str
         except Exception:
@@ -89,6 +79,35 @@ def get_active_session():
     return None, None
 
 # --- Helper Functions ---
+def compute_deep_work_sessions(df):
+    """Merge consecutive sessions (gap ≤ MERGE_GAP) and sum those ≥ 15 min."""
+    if df.empty:
+        return 0, 0
+    sorted_df = df.sort_values('start_dt').copy()
+    sorted_df['end_dt'] = sorted_df['start_dt'] + pd.to_timedelta(sorted_df['duration_sec'], unit='s')
+
+    merged = []
+    for _, row in sorted_df.iterrows():
+        # Check gap
+        if merged and (row['start_dt'] - merged[-1]['end_dt']) <= MERGE_GAP:
+            # Check project match if strict merging is enabled
+            if CROSS_PROJECT_MERGE or row['project'] == merged[-1]['project']:
+                merged[-1]['end_dt'] = max(merged[-1]['end_dt'], row['end_dt'])
+            else:
+                merged.append({'project': row['project'], 'start_dt': row['start_dt'], 'end_dt': row['end_dt']})
+        else:
+            merged.append({'project': row['project'], 'start_dt': row['start_dt'], 'end_dt': row['end_dt']})
+
+    deep_count = 0
+    deep_sec = 0
+    for s in merged:
+        dur = (s['end_dt'] - s['start_dt']).total_seconds()
+        if dur >= 900:
+            deep_count += 1
+            deep_sec += dur
+            
+    return deep_count, deep_sec
+
 def compute_streak(dates_series):
     """Compute current and longest streak of consecutive coding days."""
     if dates_series.empty:
@@ -151,62 +170,54 @@ else:
 # --- Sidebar Filters ---
 st.sidebar.header("Filters")
 if not df.empty:
-    # Category filter (All / Personal / Work)
-    category_filter = st.sidebar.radio(
-        "Category",
-        options=["All", "Personal", "Work"],
-        index=0,
-        horizontal=True
+    df['date_only'] = df['start_dt'].dt.date
+    min_date = df['date_only'].min()
+    max_date = df['date_only'].max()
+    
+    date_range = st.sidebar.date_input(
+        "Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date
     )
-    if category_filter != "All":
-        df = df[df['category'] == category_filter.lower()]
-
-    if df.empty:
-        st.sidebar.info(f"No sessions recorded for **{category_filter}** yet.")
-    else:
-        df['date_only'] = df['start_dt'].dt.date
-        min_date = df['date_only'].min()
-        max_date = df['date_only'].max()
-        
-        date_range = st.sidebar.date_input(
-            "Date Range",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date
-        )
-        
-        if len(date_range) == 2:
-            start_date, end_date = date_range
-            df = df[(df['date_only'] >= start_date) & (df['date_only'] <= end_date)]
-        
-        # Project filter
-        all_projects = sorted(df['project'].unique().tolist())
-        selected_projects = st.sidebar.multiselect("Projects", all_projects, default=all_projects)
-        if selected_projects:
-            df = df[df['project'].isin(selected_projects)]
+    
+    if len(date_range) == 2:
+        start_date, end_date = date_range
+        df = df[(df['date_only'] >= start_date) & (df['date_only'] <= end_date)]
+    
+    # Project filter
+    all_projects = sorted(df['project'].unique().tolist())
+    selected_projects = st.sidebar.multiselect("Projects", all_projects, default=all_projects)
+    if selected_projects:
+        df = df[df['project'].isin(selected_projects)]
 
 # --- Top Level Metrics ---
 if not df.empty:
-    col1, col2, col3, col4, col5 = st.columns(5)
+    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
     
     total_sessions = len(df)
     total_time_sec = df['duration_sec'].sum()
-    total_time_str = str(timedelta(seconds=int(total_time_sec)))
+    total_time_str = fmt_duration(total_time_sec)
     unique_projects = df['project'].nunique()
     avg_session_sec = df['duration_sec'].mean()
     
-    # Deep work: sessions >= 15 min
-    deep_work_count = len(df[df['duration_sec'] >= 900])
-    deep_work_pct = (deep_work_count / total_sessions * 100) if total_sessions > 0 else 0
+    # Deep work metrics
+    deep_work_count, deep_work_sec = compute_deep_work_sessions(df)
+    deep_work_hours_str = f"{deep_work_sec / 3600:.1f}h" if deep_work_sec > 0 else "0h"
+    focus_pct = (deep_work_sec / total_time_sec * 100) if total_time_sec > 0 else 0
     
-    col1.metric("Total Sessions", total_sessions)
-    col2.metric("Total Time", total_time_str)
-    col3.metric("Projects", unique_projects)
-    col4.metric("Avg Session", fmt_duration(avg_session_sec))
-    col5.metric("Deep Work", f"{deep_work_pct:.0f}%", help="Sessions ≥ 15 min as % of total")
+    merge_gap_min = MERGE_GAP.total_seconds() / 60
+    merge_desc = f"gap ≤ {merge_gap_min:.0f}m"
+    if CROSS_PROJECT_MERGE: merge_desc += ", cross-project"
+    
+    mcol1.metric("Total Time", total_time_str)
+    mcol2.metric("Avg Session", fmt_duration(avg_session_sec))
+    mcol3.metric("Deep Work", deep_work_hours_str, help=f"Total hours in merged sessions ({merge_desc}) ≥ 15 min")
+    mcol4.metric("Focus Score", f"{focus_pct:.0f}%", help="Deep Work Hours ÷ Total Hours")
     
     # Streak row
     current_streak, longest_streak = compute_streak(df['date_only'])
+
     
     scol1, scol2, scol3, scol4 = st.columns(4)
     
@@ -245,7 +256,7 @@ with tab1:
         
         st.dataframe(
             display_df,
-            width='stretch',
+            use_container_width=True,
             hide_index=True
         )
 
@@ -256,17 +267,53 @@ with tab2:
         st.subheader("📆 Daily Coding Heatmap")
         heatmap_data = df.groupby('date_only')['duration_sec'].sum().reset_index()
         heatmap_data['Hours'] = heatmap_data['duration_sec'] / 3600
+        heatmap_data = heatmap_data.sort_values('date_only')
         
-        fig_heat = px.bar(
-            heatmap_data,
-            x='date_only',
-            y='Hours',
-            labels={'date_only': 'Date', 'Hours': 'Hours'},
-            color='Hours',
-            color_continuous_scale='Blues'
+        # Calculate rolling averages
+        heatmap_data['7d_Avg'] = heatmap_data['Hours'].rolling(window=7, min_periods=1).mean()
+        heatmap_data['30d_Avg'] = heatmap_data['Hours'].rolling(window=30, min_periods=1).mean()
+        
+        fig_heat = go.Figure()
+        
+        # Bar chart for daily hours
+        fig_heat.add_trace(go.Bar(
+            x=heatmap_data['date_only'],
+            y=heatmap_data['Hours'],
+            name='Daily Hours',
+            marker_color=heatmap_data['Hours'],
+            marker_colorscale='Blues',
+            hovertemplate='%{y:.1f}h<extra></extra>'
+        ))
+        
+        # 7-day rolling average
+        fig_heat.add_trace(go.Scatter(
+            x=heatmap_data['date_only'],
+            y=heatmap_data['7d_Avg'],
+            name='7d Avg',
+            mode='lines',
+            line=dict(color='orange', width=2),
+            hovertemplate='%{y:.1f}h (7d avg)<extra></extra>'
+        ))
+        
+        # 30-day rolling average
+        if len(heatmap_data) >= 14:  # Only show if we have decent data
+            fig_heat.add_trace(go.Scatter(
+                x=heatmap_data['date_only'],
+                y=heatmap_data['30d_Avg'],
+                name='30d Avg',
+                mode='lines',
+                line=dict(color='red', width=2, dash='dot'),
+                hovertemplate='%{y:.1f}h (30d avg)<extra></extra>'
+            ))
+            
+        fig_heat.update_layout(
+            margin=dict(t=10),
+            xaxis_title='Date',
+            yaxis_title='Hours',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
         )
-        fig_heat.update_layout(margin=dict(t=10))
-        st.plotly_chart(fig_heat, width='stretch')
+
+        st.plotly_chart(fig_heat, use_container_width=True)
         st.divider()
         
         # --- Row 2: Project & Branch donuts ---
@@ -285,7 +332,7 @@ with tab2:
                 color_discrete_sequence=px.colors.sequential.Teal
             )
             fig.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
             
         with col_chart2:
             st.subheader("🌿 Time per Branch")
@@ -300,7 +347,7 @@ with tab2:
                 color_discrete_sequence=px.colors.sequential.Purp
             )
             fig_branch.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig_branch, width='stretch')
+            st.plotly_chart(fig_branch, use_container_width=True)
         
         st.divider()
         
@@ -326,7 +373,7 @@ with tab2:
                 color_continuous_scale='Sunset'
             )
             fig_peak.update_layout(margin=dict(t=10), showlegend=False)
-            st.plotly_chart(fig_peak, width='stretch')
+            st.plotly_chart(fig_peak, use_container_width=True)
         
         with col_dow:
             st.subheader("📅 Day-of-Week Pattern")
@@ -348,7 +395,7 @@ with tab2:
                 category_orders={'day_name': day_order}
             )
             fig_dow.update_layout(margin=dict(t=10))
-            st.plotly_chart(fig_dow, width='stretch')
+            st.plotly_chart(fig_dow, use_container_width=True)
         
         st.divider()
         
@@ -371,7 +418,7 @@ with tab2:
                 bargap=0.1,
                 yaxis_title='Number of Sessions'
             )
-            st.plotly_chart(fig_hist, width='stretch')
+            st.plotly_chart(fig_hist, use_container_width=True)
         
         with col_trend:
             st.subheader("📈 Weekly Coding Trend")
@@ -392,11 +439,58 @@ with tab2:
             )
             fig_weekly.update_layout(margin=dict(t=10))
             fig_weekly.update_traces(line=dict(width=3, color='#00CC96'), marker=dict(size=8))
-            st.plotly_chart(fig_weekly, width='stretch')
+            st.plotly_chart(fig_weekly, use_container_width=True)
         
         st.divider()
         
-        # --- Row 5: Recent Sessions ---
+        # --- Row 5: Session Gantt Chart & Recent Sessions ---
+        st.subheader("🗺️ Session Timeline")
+        # Format for Plotly Gantt (timeline)
+        timeline_df = df.copy()
+        
+        # Convert times to proper datetimes if not already for plotting
+        timeline_df['start_dt'] = pd.to_datetime(timeline_df['start_time'])
+        # Handle cases where end span might be identical to start (0 sec) to ensure it renders
+        timeline_df['end_dt'] = timeline_df.apply(
+            lambda x: x['start_dt'] + timedelta(seconds=max(60, x['duration_sec'])), 
+            axis=1
+        )
+        
+        # We'll just show the last 7 days of sessions to not overload the chart
+        week_ago = pd.Timestamp.now() - pd.Timedelta(days=7)
+        recent_timeline = timeline_df[timeline_df['start_dt'] >= week_ago].copy()
+        
+        if not recent_timeline.empty:
+            # Map projects to colors so they are consistent per row
+            projects = recent_timeline['project'].unique()
+            colors = px.colors.qualitative.Plotly * (len(projects) // len(px.colors.qualitative.Plotly) + 1)
+            color_map = {proj: colors[i] for i, proj in enumerate(projects)}
+            
+            # Use 'project' for the Y axis
+            fig_gantt = px.timeline(
+                recent_timeline,
+                x_start="start_dt",
+                x_end="end_dt",
+                y="project",
+                color="project",
+                color_discrete_map=color_map,
+                hover_name="git_branch",
+                hover_data={"duration_str": True, "project": False, "start_dt": False, "end_dt": False}
+            )
+            fig_gantt.update_yaxes(autorange="reversed")  # Top down
+            fig_gantt.update_layout(
+                margin=dict(t=10), 
+                showlegend=False,
+                xaxis_title="Time",
+                yaxis_title="Project"
+            )
+            st.plotly_chart(fig_gantt, use_container_width=True)
+            st.caption("Showing sessions from the last 7 days.")
+        else:
+            st.info("No sessions in the last 7 days to display on timeline.")
+            
+        st.divider()
+        
         st.subheader("🕓 Recent Sessions Overview")
         fig_bar = px.bar(
             df.head(20),
@@ -407,7 +501,7 @@ with tab2:
             labels={'duration_sec': 'Duration (Seconds)', 'id': 'Session ID'},
         )
         fig_bar.update_layout(margin=dict(t=10))
-        st.plotly_chart(fig_bar, width='stretch')
+        st.plotly_chart(fig_bar, use_container_width=True)
         
     else:
         st.info("Not enough data for analytics yet.")
@@ -428,7 +522,7 @@ with tab3:
         
         st.dataframe(
             avg_by_project[['Project', 'Sessions', 'Avg Duration', 'Median Duration', 'Total Time']],
-            width='stretch',
+            use_container_width=True,
             hide_index=True
         )
         
@@ -439,7 +533,7 @@ with tab3:
         top_sessions = df.nlargest(5, 'duration_sec')[['project', 'git_branch', 'start_time', 'duration_str']].copy()
         top_sessions.columns = ['Project', 'Branch', 'Started', 'Duration']
         top_sessions['Branch'] = top_sessions['Branch'].fillna('N/A')
-        st.dataframe(top_sessions, width='stretch', hide_index=True)
+        st.dataframe(top_sessions, use_container_width=True, hide_index=True)
         
         st.divider()
         
