@@ -1,5 +1,6 @@
 import time
 import os
+import re
 import subprocess
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -7,6 +8,25 @@ from watchdog.events import FileSystemEventHandler
 import db
 import session_manager as sm
 import config
+
+# An event counts as activity only when it carries a verified human-editor
+# signature. Bots that open(path, 'w') leave no such trace and are dropped.
+# Pattern set: vim probe/swap/undo, emacs lock/backup, generic tilde backup,
+# VS Code / Cursor / JetBrains atomic-write temp names.
+EDITOR_ARTIFACT_RE = re.compile(
+    r"""^(
+        4913
+      | \..*\.sw[a-z]
+      | .*\.sw[a-z]
+      | .*~
+      | \.\#.*
+      | .*\.un~
+      | \..*\.tmp
+      | \..*\.tmp\.\w+
+      | \..*\.sb-[\w-]+
+    )$""",
+    re.VERBOSE,
+)
 
 # Initialize database and recover any stranded sessions from previous crash
 db.init()
@@ -57,17 +77,13 @@ _last_seen = {}
 DEBOUNCE_SEC = 2
 
 class CodeHandler(FileSystemEventHandler):
-    def _handle_event(self, event):
-        if event.is_directory:
-            return
-
-        file_path = event.src_path
+    def _handle_event(self, event, file_path):
         file_name = os.path.basename(file_path)
-        
+
         # 1. Ignore own internal files
         if file_name in [DB_PATH, LOG_FILE, ACTIVE_SESSION_FILE]:
             return
-            
+
         # 2. Ignore heavy database/log/temp extensions that cause phantom sessions
         ignored_exts = {'.db', '.db-journal', '.db-wal', '.db-shm', '.log', '.tmp', '.ipynb', '.pyc', '.csv'}
         if any(file_name.endswith(ext) for ext in ignored_exts):
@@ -89,14 +105,16 @@ class CodeHandler(FileSystemEventHandler):
             branch = get_git_branch(project_root)
             sm.activity_detected(project, branch, category)
 
-    def on_modified(self, event):
-        self._handle_event(event)
-
-    def on_created(self, event):
-        self._handle_event(event)
-
     def on_moved(self, event):
-        self._handle_event(event)
+        # The only path to a tracked event: an editor atomically renaming
+        # its temp/swap file over the target. The src basename carries the
+        # editor signature; the dest is the real file being edited.
+        if event.is_directory:
+            return
+        src_name = os.path.basename(event.src_path)
+        if not EDITOR_ARTIFACT_RE.match(src_name):
+            return
+        self._handle_event(event, event.dest_path)
 
 observer = Observer()
 
