@@ -1,5 +1,4 @@
 import time
-import json
 import os
 import subprocess
 from watchdog.observers import Observer
@@ -7,15 +6,18 @@ from watchdog.events import FileSystemEventHandler
 
 import db
 import session_manager as sm
+import config
 
+# Initialize database and recover any stranded sessions from previous crash
 db.init()
 sm.recover_orphaned_session()
 
-with open("config.json") as f:
-    config = json.load(f)
-
-WATCH_PATHS = config.get("watch", [])
-IGNORE_DIRS = config.get("ignore_dirs", [".git", "__pycache__", "node_modules", "venv"])
+# Load configuration from centralized config module
+WATCH_ROOTS = config.WATCH_ROOTS
+IGNORE_DIRS = config.IGNORE_DIRS
+DB_PATH = os.path.basename(config.DB_PATH)
+LOG_FILE = os.path.basename(config.LOG_FILE)
+ACTIVE_SESSION_FILE = os.path.basename(config.ACTIVE_SESSION_FILE)
 
 def get_git_branch(directory):
     try:
@@ -28,30 +30,85 @@ def get_git_branch(directory):
     except Exception:
         return None
 
+def resolve_project(file_path):
+    """
+    Resolve which project a file belongs to.
+    Returns (project_name, project_root_dir, category) or (None, None, None).
+    """
+    file_path = os.path.abspath(file_path)
+    
+    for watch_path, category in WATCH_ROOTS.items():
+        watch_path = os.path.abspath(watch_path).rstrip(os.sep)
+        if file_path.startswith(watch_path + os.sep):
+            relative = file_path[len(watch_path) + 1:]
+            parts = relative.split(os.sep)
+            
+            if parts and parts[0]:
+                project_name = parts[0]
+                project_root = os.path.join(watch_path, project_name)
+                
+                # We only track subdirectories as projects. 
+                # Individual files in the root apps folder are ignored to avoid "Apps" noise.
+                if os.path.isdir(project_root):
+                    return project_name, project_root, category
+    return None, None, None
+
+_last_seen = {}
+DEBOUNCE_SEC = 2
+
 class CodeHandler(FileSystemEventHandler):
-    def on_modified(self, event):
+    def _handle_event(self, event):
         if event.is_directory:
             return
-            
-        # Ignore configured junk directories
-        if any(f"/{d}/" in event.src_path or event.src_path.endswith(f"/{d}") for d in IGNORE_DIRS):
+
+        file_path = event.src_path
+        file_name = os.path.basename(file_path)
+        
+        # 1. Ignore own internal files
+        if file_name in [DB_PATH, LOG_FILE, ACTIVE_SESSION_FILE]:
             return
             
-        # Match configured project path natively
-        project = None
-        for watch_path in WATCH_PATHS:
-            if event.src_path.startswith(watch_path):
-                project = os.path.basename(watch_path)
-                break
-                
+        # 2. Ignore heavy database/log/temp extensions that cause phantom sessions
+        ignored_exts = {'.db', '.db-journal', '.db-wal', '.db-shm', '.log', '.tmp', '.ipynb', '.pyc', '.csv'}
+        if any(file_name.endswith(ext) for ext in ignored_exts):
+            return
+
+        # 3. Ignore configured junk directories
+        if any(f"{os.sep}{d}{os.sep}" in file_path or file_path.endswith(f"{os.sep}{d}") for d in IGNORE_DIRS):
+            return
+
+        # Debounce
+        now = time.time()
+        prev = _last_seen.get(file_path, 0)
+        if now - prev < DEBOUNCE_SEC:
+            return
+        _last_seen[file_path] = now
+
+        project, project_root, category = resolve_project(file_path)
         if project:
-            branch = get_git_branch(os.path.dirname(event.src_path))
-            sm.activity_detected(project, branch)
+            branch = get_git_branch(project_root)
+            sm.activity_detected(project, branch, category)
+
+    def on_modified(self, event):
+        self._handle_event(event)
+
+    def on_created(self, event):
+        self._handle_event(event)
+
+    def on_moved(self, event):
+        self._handle_event(event)
 
 observer = Observer()
 
-for path in WATCH_PATHS:
-    observer.schedule(CodeHandler(), path, recursive=True)
+if not WATCH_ROOTS:
+    print("[WARNING] No watch paths configured in config.json. Tracking will not work.")
+else:
+    for path in WATCH_ROOTS.keys():
+        if os.path.exists(path):
+            print(f"Scheduling watcher for: {path}")
+            observer.schedule(CodeHandler(), path, recursive=True)
+        else:
+            print(f"[ERROR] Watch path does not exist: {path}")
 
 observer.start()
 
@@ -64,6 +121,9 @@ try:
 
 except KeyboardInterrupt:
     print("Stopping observer...")
+    observer.stop()
+except Exception as e:
+    print(f"Tracker encountered an error: {e}")
     observer.stop()
 finally:
     # Ensure current session data is logged to DB safely on exit

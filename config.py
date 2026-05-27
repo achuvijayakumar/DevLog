@@ -27,15 +27,20 @@ except json.JSONDecodeError as e:
 
 # --- Exported config values ---
 
-# New: watch_roots maps root folders to category labels (personal / work).
+# watch_roots maps root folders to category labels (e.g. "personal" / "work").
 # Each immediate subfolder inside a root is treated as a separate project.
 WATCH_ROOTS = _config.get("watch_roots", {})
 
-# Legacy: flat watch list (kept for backward compatibility, ignored if watch_roots is set)
-WATCH_PATHS = _config.get("watch", [])
+# Legacy: flat watch list (converted to WATCH_ROOTS with "default" category if WATCH_ROOTS is empty)
+_legacy_watch = _config.get("watch", [])
+if not WATCH_ROOTS and _legacy_watch:
+    WATCH_ROOTS = {path.rstrip(os.sep): "default" for path in _legacy_watch}
 
 IDLE_TIMEOUT_SECONDS = _config.get("idle_timeout_seconds", 300)
 IGNORE_DIRS = _config.get("ignore_dirs", [".git", "__pycache__", "node_modules", "venv"])
+MIN_SESSION_SECONDS = _config.get("min_session_seconds", 10)
+MERGE_GAP_SECONDS = _config.get("merge_gap_seconds", 300)
+CROSS_PROJECT_MERGE = _config.get("cross_project_merge", False)
 
 # --- Platform-aware paths ---
 DB_PATH = os.path.join(PROJECT_ROOT, "devlog.db")

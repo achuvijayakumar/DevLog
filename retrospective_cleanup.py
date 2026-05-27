@@ -1,89 +1,39 @@
 import sqlite3
-import json
-import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
-DB_NAME = "/home/memoryping/apps/Devlog/devlog.db"
-CONFIG_FILE = "/home/memoryping/apps/Devlog/config.json"
+def cleanup():
+    conn = sqlite3.connect("devlog.db")
+    cur = conn.cursor()
 
-with open(CONFIG_FILE) as f:
-    config = json.load(f)
+    print("--- Starting Retroactive Cleanup ---")
 
-MIN_SESSION_SECONDS = config.get("min_session_seconds", 10)
-MERGE_GAP = timedelta(seconds=config.get("merge_gap_seconds", 300))
-CROSS_PROJECT_MERGE = config.get("cross_project_merge", False)
+    # 1. Remove exact/near duplicates (sessions for same project starting within 1 second of each other)
+    print("Deleting duplicate sessions...")
+    cur.execute("""
+        DELETE FROM sessions 
+        WHERE id NOT IN (
+            SELECT MIN(id) 
+            FROM sessions 
+            GROUP BY project, SUBSTR(start_time, 1, 19), duration
+        )
+    """)
+    removed_dupes = cur.rowcount
+    print(f"Removed {removed_dupes} duplicate entries.")
 
-conn = sqlite3.connect(DB_NAME)
-cur = conn.cursor()
+    # 2. Fix missing categories
+    print("Fixing missing categories...")
+    cur.execute("UPDATE sessions SET category = 'default' WHERE category IS NULL OR category = 'None'")
+    updated_cats = cur.rowcount
+    print(f"Updated {updated_cats} records with default category.")
 
-# 1. Delete short sessions
-cur.execute("DELETE FROM sessions WHERE duration < ?", (MIN_SESSION_SECONDS,))
-deleted_short = cur.rowcount
-print(f"Deleted {deleted_short} noise sessions (< {MIN_SESSION_SECONDS}s).")
+    # 3. Correct project names for legacy records (e.g., 'Root' to 'Global')
+    cur.execute("UPDATE sessions SET project = 'Global' WHERE project = 'Root'")
+    updated_names = cur.rowcount
+    print(f"Renamed {updated_names} 'Root' projects to 'Global'.")
 
-# 2. Merge older sessions
-cur.execute("SELECT id, project, start_time, end_time, duration, git_branch FROM sessions ORDER BY start_time ASC")
-rows = cur.fetchall()
+    conn.commit()
+    conn.close()
+    print("--- Cleanup Complete ---")
 
-merged_sessions = []
-to_delete = []
-updates = {}  # id -> (new_end_str, new_duration)
-
-for row in rows:
-    sid, proj, start_str, end_str, dur, branch = row
-    
-    try:
-        # Some older entries might not have an end_time if it's missing (rare, but handle safely)
-        start_dt = pd.to_datetime(start_str) if 'pd' in globals() else datetime.fromisoformat(start_str)
-        # sqlite might return strings like "2026-03-22 10:00:00" without the T, but fromisoformat handles most.
-    except Exception:
-        # Fallback simple string parse
-        try:
-            start_dt = datetime.strptime(start_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            try:
-                start_dt = datetime.strptime(start_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
-            except Exception as e:
-                print(f"Skipping unparseable date {start_str}: {e}")
-                continue
-
-    try:
-        end_dt = datetime.fromisoformat(end_str) if end_str else start_dt + timedelta(seconds=dur or 0)
-    except Exception:
-        try:
-            end_dt = datetime.strptime(end_str.split('.')[0], "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            try:
-                end_dt = datetime.strptime(end_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
-            except Exception:
-                end_dt = start_dt + timedelta(seconds=dur or 0)
-
-    s = {
-        'id': sid,
-        'project': proj,
-        'start_dt': start_dt,
-        'end_dt': end_dt,
-    }
-    
-    if merged_sessions and (s['start_dt'] - merged_sessions[-1]['end_dt']) <= MERGE_GAP:
-        if CROSS_PROJECT_MERGE or s['project'] == merged_sessions[-1]['project']:
-            # Overlap/Close enough -> MERGE
-            merged_sessions[-1]['end_dt'] = max(merged_sessions[-1]['end_dt'], s['end_dt'])
-            to_delete.append(s['id'])
-            
-            new_dur = int((merged_sessions[-1]['end_dt'] - merged_sessions[-1]['start_dt']).total_seconds())
-            updates[merged_sessions[-1]['id']] = (merged_sessions[-1]['end_dt'].isoformat(), new_dur)
-            continue
-            
-    merged_sessions.append(s)
-
-for sid, (new_end, new_dur) in updates.items():
-    cur.execute("UPDATE sessions SET end_time = ?, duration = ? WHERE id = ?", (new_end, new_dur, sid))
-
-for sid in to_delete:
-    cur.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-
-conn.commit()
-conn.close()
-
-print(f"Merged {len(to_delete)} close/overlapping sessions into their parent sessions.")
+if __name__ == "__main__":
+    cleanup()
